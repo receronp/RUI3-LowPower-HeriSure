@@ -1,19 +1,20 @@
 /**
- * @file RUI3-Modular.ino
- * @author Bernd Giesecke (bernd@giesecke.tk)
- * @brief RUI3 based code for low power practice
+ * @file RUI3-LowPower-HeriSure.ino
+ * @author Raul Ceron (recerpin@posgrado.upv.es)
+ * @brief RUI3 based code for low power RAK1901 data transmission
  * @version 0.1
- * @date 2023-03-29
+ * @date 2025-01-26
  *
- * @copyright Copyright (c) 2023
+ * @copyright Copyright (c) 2025
  *
  */
 #include "app.h"
+#include "sensor_rak1901.hpp"
 
 /** Packet is confirmed/unconfirmed (Set with AT commands) */
 bool g_confirmed_mode = false;
 /** If confirmed packet, number or retries (Set with AT commands) */
-uint8_t g_confirmed_retry = 0;
+uint8_t g_confirmed_retry = 1;
 /** Data rate  (Set with AT commands) */
 uint8_t g_data_rate = 3;
 
@@ -21,12 +22,15 @@ uint8_t g_data_rate = 3;
 volatile bool tx_active = false;
 
 /** fPort to send packages */
-uint8_t set_fPort = 2;
+uint8_t fPort = 66;
 
 /** Payload buffer */
-uint8_t g_solution_data[64];
+uint8_t uplink_payload[64];
 
 uint16_t my_fcount = 1;
+
+int16_t temperature_encoded = 0;
+int16_t humidity_encoded = 0;
 
 /**
  * @brief Callback after join request cycle
@@ -65,18 +69,6 @@ void receiveCallback(SERVICE_LORA_RECEIVE_T *data)
 }
 
 /**
- * @brief Callback for LinkCheck result
- *
- * @param data pointer to structure with the linkcheck result
- */
-void linkcheckCallback(SERVICE_LORA_LINKCHECK_T *data)
-{
-	MYLOG("LC_CB", "%s Margin %d GW# %d RSSI%d SNR %d", data->State == 0 ? "Success" : "Failed",
-		  data->DemodMargin, data->NbGateways,
-		  data->Rssi, data->Snr);
-}
-
-/**
  * @brief LoRaWAN callback after TX is finished
  *
  * @param status TX status
@@ -89,69 +81,28 @@ void sendCallback(int32_t status)
 }
 
 /**
- * @brief LoRa P2P callback if a packet was received
- *
- * @param data pointer to the data with the received data
- */
-void recv_cb(rui_lora_p2p_recv_t data)
-{
-	MYLOG("RX-P2P-CB", "P2P RX, RSSI %d, SNR %d", data.Rssi, data.Snr);
-	for (int i = 0; i < data.BufferSize; i++)
-	{
-		Serial.printf("%02X", data.Buffer[i]);
-	}
-	Serial.print("\r\n");
-	tx_active = false;
-}
-
-/**
- * @brief LoRa P2P callback if a packet was sent
- *
- */
-void send_cb(void)
-{
-	MYLOG("TX-P2P-CB", "P2P TX finished");
-	digitalWrite(LED_BLUE, LOW);
-	tx_active = false;
-}
-
-/**
- * @brief LoRa P2P callback for CAD result
- *
- * @param result true if activity was detected, false if no activity was detected
- */
-void cad_cb(bool result)
-{
-	MYLOG("CAD-P2P-CB", "P2P CAD reports %s", result ? "activity" : "no activity");
-}
-
-/**
  * @brief Arduino setup, called once after reboot/power-up
  *
  */
 void setup()
 {
-	// Setup for LoRaWAN
-	if (api.lorawan.nwm.get() == 1)
+	/* Make sure module is in LoRaWAN mode */
+	if (api.lorawan.nwm.get() != 1) /* check LoRaWAN mode */
 	{
-		g_confirmed_mode = api.lorawan.cfm.get();
-
-		g_confirmed_retry = api.lorawan.rety.get();
-
-		g_data_rate = api.lorawan.dr.get();
-
-		// Setup the callbacks for joined and send finished
-		api.lorawan.registerRecvCallback(receiveCallback);
-		api.lorawan.registerSendCallback(sendCallback);
-		api.lorawan.registerJoinCallback(joinCallback);
-		api.lorawan.registerLinkCheckCallback(linkcheckCallback);
+		if (api.lorawan.nwm.set()) /* set LoRaWAN mode */
+		{
+			api.system.reboot();
+		}
 	}
-	else // Setup for LoRa P2P
-	{
-		api.lora.registerPRecvCallback(recv_cb);
-		api.lora.registerPSendCallback(send_cb);
-		api.lora.registerPSendCADCallback(cad_cb);
-	}
+
+	g_confirmed_mode = api.lorawan.cfm.get();
+	g_confirmed_retry = api.lorawan.rety.get();
+	g_data_rate = api.lorawan.dr.get();
+
+	// Setup the callbacks for joined and send finished
+	api.lorawan.registerRecvCallback(receiveCallback);
+	api.lorawan.registerSendCallback(sendCallback);
+	api.lorawan.registerJoinCallback(joinCallback);
 
 	pinMode(LED_GREEN, OUTPUT);
 	digitalWrite(LED_GREEN, HIGH);
@@ -167,7 +118,7 @@ void setup()
 	// Delay for 5 seconds to give the chance for AT+BOOT
 	delay(5000);
 
-	api.system.firmwareVersion.set("RUI3-Low-Power-V1.0.0");
+	api.system.firmwareVersion.set("RUI3-LowPower-HeriSure-V1.0.0");
 
 	Serial.println("RAKwireless RUI3 Node");
 	Serial.println("------------------------------------------------------");
@@ -203,14 +154,6 @@ void setup()
 		api.system.timer.start(RAK_TIMER_0, custom_parameters.send_interval, NULL);
 	}
 
-	// Check if it is LoRa P2P
-	if (api.lorawan.nwm.get() == 0)
-	{
-		digitalWrite(LED_BLUE, LOW);
-
-		sensor_handler(NULL);
-	}
-
 	if (api.lorawan.nwm.get() == 1)
 	{
 		if (g_confirmed_mode)
@@ -227,16 +170,16 @@ void setup()
 		MYLOG("SETUP", "DR = %d", g_data_rate);
 	}
 
+	/** Wait for Join success */
+	while (api.lorawan.njs.get() == 0)
+	{
+		Serial.println("Wait for LoRaWAN join...");
+		api.lorawan.join();
+		delay(10000);
+	}
+
 	// Enable low power mode
 	api.system.lpm.set(1);
-
-	// If available, enable BLE advertising for 30 seconds and open the BLE UART channel
-#if defined(_VARIANT_RAK3172_) || defined(_VARIANT_RAK3172_SIP_)
-// No BLE
-#else
-	Serial6.begin(115200, RAK_AT_MODE);
-	api.ble.advertise.start(30);
-#endif
 }
 
 /**
@@ -260,11 +203,20 @@ void sensor_handler(void *)
 		}
 	}
 
-	// Create payload (Cayenne LPP format for voltage)
-	g_solution_data[0] = 0x01;
-	g_solution_data[1] = 0x74;
-	g_solution_data[2] = 0x01;
-	g_solution_data[3] = 0x8c;
+	temperature_encoded = temperature_Read() * 10.0f;
+	humidity_encoded = humidity_Read() * 2.0f;
+
+	// Create payload
+	// Cayenne LPP temperature
+	uplink_payload[0] = 0x01;
+	uplink_payload[1] = 0x67; // Cayenne LPP temperature
+	uplink_payload[2] = (uint8_t)(temperature_encoded >> 8);
+	uplink_payload[3] = (uint8_t)(temperature_encoded & 0xFF);
+
+	// Cayenne LPP humidity
+	uplink_payload[4] = 0x01;
+	uplink_payload[5] = 0x68; // Cayenne LPP humidity
+	uplink_payload[6] = (uint8_t)(humidity_encoded);
 
 	// Send the packet
 	send_packet();
@@ -278,38 +230,18 @@ void sensor_handler(void *)
  */
 void send_packet(void)
 {
-	// Check if it is LoRaWAN
-	if (api.lorawan.nwm.get() == 1)
+	MYLOG("UPLINK", "Sending packet # %d", my_fcount);
+	my_fcount++;
+	// Send the packet
+	if (api.lorawan.send(7, uplink_payload, fPort, g_confirmed_mode, g_confirmed_retry))
 	{
-		MYLOG("UPLINK", "Sending packet # %d", my_fcount);
-		my_fcount++;
-		// Send the packet
-		if (api.lorawan.send(4, g_solution_data, set_fPort, g_confirmed_mode, g_confirmed_retry))
-		{
-			MYLOG("UPLINK", "Packet enqueued, size 4");
-			tx_active = true;
-		}
-		else
-		{
-			MYLOG("UPLINK", "Send failed");
-			tx_active = false;
-		}
+		MYLOG("UPLINK", "Packet enqueued, size 4");
+		tx_active = true;
 	}
-	// It is P2P
 	else
 	{
-		MYLOG("UPLINK", "Send packet with size 4 over P2P");
-
-		digitalWrite(LED_BLUE, LOW);
-
-		if (api.lora.psend(4, g_solution_data, false))
-		{
-			MYLOG("UPLINK", "Packet enqueued");
-		}
-		else
-		{
-			MYLOG("UPLINK", "Send failed");
-		}
+		MYLOG("UPLINK", "Send failed");
+		tx_active = false;
 	}
 }
 
