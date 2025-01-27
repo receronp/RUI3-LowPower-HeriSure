@@ -60,3 +60,4 @@ bool init_status_at(void);
 bool init_interval_at(void);
 bool get_at_setting(void);
 bool save_at_setting(void);
+int update_send_interval(const char *argv);

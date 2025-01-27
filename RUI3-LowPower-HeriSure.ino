@@ -8,29 +8,38 @@
  * @copyright Copyright (c) 2025
  *
  */
+
 #include "app.h"
 #include "sensor_rak1901.hpp"
 
-/** Packet is confirmed/unconfirmed (Set with AT commands) */
-bool g_confirmed_mode = false;
-/** If confirmed packet, number or retries (Set with AT commands) */
-uint8_t g_confirmed_retry = 1;
-/** Data rate  (Set with AT commands) */
-uint8_t g_data_rate = 3;
+enum class Command : uint8_t
+{
+  SetAlarm = 0,
+  SetInterval = 1
+};
 
-/** Flag if transmit is active, used by some sensors */
-volatile bool tx_active = false;
+// Structure to hold LoRaWAN settings
+struct LoraWanConfig
+{
+  bool confirmedMode = false;
+  uint8_t confirmedRetry = 1;
+  uint8_t dataRate = 3;
+};
 
-/** fPort to send packages */
-uint8_t fPort = 66;
+// Structure to hold application state
+struct AppState
+{
+  volatile bool txActive = false;
+  uint8_t fPort = 66;
+  uint8_t uplinkPayload[64];
+  uint16_t frameCounter = 1;
+  int16_t temperature = 0;
+  int16_t humidity = 0;
+};
 
-/** Payload buffer */
-uint8_t uplink_payload[64];
-
-uint16_t my_fcount = 1;
-
-int16_t temperature_encoded = 0;
-int16_t humidity_encoded = 0;
+// Global instances of the structs
+LoraWanConfig loraConfig;
+AppState appState;
 
 /**
  * @brief Callback after join request cycle
@@ -42,8 +51,6 @@ void joinCallback(int32_t status)
   if (status != 0)
   {
     MYLOG("JOIN-CB", "LoRaWan OTAA - join fail! \r\n");
-    // To be checked if this makes sense
-    // api.lorawan.join();
   }
   else
   {
@@ -60,12 +67,36 @@ void joinCallback(int32_t status)
 void receiveCallback(SERVICE_LORA_RECEIVE_T *data)
 {
   MYLOG("RX-CB", "RX, port %d, DR %d, RSSI %d, SNR %d", data->Port, data->RxDatarate, data->Rssi, data->Snr);
-  for (int i = 0; i < data->BufferSize; i++)
+
+  switch (static_cast<Command>(data->Buffer[0]))
   {
-    Serial.printf("%02X", data->Buffer[i]);
+  case Command::SetAlarm:
+    digitalWrite(LED_GREEN, data->Buffer[1] != 0);
+    MYLOG("RX-CB", "Alert turned %s", data->Buffer[1] ? "on" : "off");
+    break;
+  case Command::SetInterval:
+    if (data->BufferSize > 1)
+    {
+      uint32_t newInterval = 0;
+      for (size_t i = 1; i < data->BufferSize; ++i)
+      {
+        // Big-Endian encoding from bytes received
+        newInterval = (newInterval << 8) | (uint32_t)data->Buffer[i];
+      }
+      MYLOG("RX-CB", "Requested interval %lu s", newInterval);
+      char intervalBuffer[20] = {'\n'};
+      sprintf(intervalBuffer, "%lu", newInterval);
+      MYLOG("RX-CB", "String representation: %s\n", intervalBuffer);
+
+      update_send_interval(intervalBuffer);
+    }
+    break;
+
+  default:
+    MYLOG("RX-CB", "Unknown Command received: %d", data->Buffer[0]);
+    break;
   }
-  Serial.print("\r\n");
-  tx_active = false;
+  appState.txActive = false;
 }
 
 /**
@@ -77,11 +108,38 @@ void sendCallback(int32_t status)
 {
   MYLOG("TX-CB", "TX status %d", status);
   digitalWrite(LED_BLUE, LOW);
-  tx_active = false;
+  appState.txActive = false;
 }
 
 /**
- * @brief Arduino setup, called once after reboot/power-up
+ * @brief Attempts to join the LoRaWAN network.  Loops until successful.
+ *
+ */
+void lorawanJoin(int maxRetries = 5)
+{
+  int retryCount = 0;
+  while (!api.lorawan.njs.get() && retryCount < maxRetries)
+  {
+    Serial.print("Waiting for LoRaWAN join... Attempt ");
+    Serial.println(retryCount + 1);
+    api.lorawan.join();
+    delay(10000 * ++retryCount); // Exponential backoff
+  }
+
+  if (!api.lorawan.njs.get()) // Check if join failed after max retries
+  {
+    MYLOG("LORAWAN-JOIN", "LoRaWAN join failed after multiple attempts.");
+    api.system.sleep.all(600000); // Deep sleep for 10 minutes (in milliseconds)
+  }
+  else
+  {
+    MYLOG("LORAWAN-JOIN", "LoRaWAN joined successfully!");
+  }
+}
+
+/**
+ * @brief Arduino setup function. Configures the device and initializes peripherals.
+ * Called once after reboot or power-up.
  *
  */
 void setup()
@@ -95,9 +153,10 @@ void setup()
     }
   }
 
-  g_confirmed_mode = api.lorawan.cfm.get();
-  g_confirmed_retry = api.lorawan.rety.get();
-  g_data_rate = api.lorawan.dr.get();
+  // Initialize LoRaWAN config
+  loraConfig.confirmedMode = api.lorawan.cfm.get();
+  loraConfig.confirmedRetry = api.lorawan.rety.get();
+  loraConfig.dataRate = api.lorawan.dr.get();
 
   // Setup the callbacks for joined and send finished
   api.lorawan.registerRecvCallback(receiveCallback);
@@ -156,7 +215,7 @@ void setup()
 
   if (api.lorawan.nwm.get() == 1)
   {
-    if (g_confirmed_mode)
+    if (loraConfig.confirmedMode)
     {
       MYLOG("SETUP", "Confirmed enabled");
     }
@@ -165,18 +224,12 @@ void setup()
       MYLOG("SETUP", "Confirmed disabled");
     }
 
-    MYLOG("SETUP", "Retry = %d", g_confirmed_retry);
+    MYLOG("SETUP", "Retry = %d", loraConfig.confirmedRetry);
 
-    MYLOG("SETUP", "DR = %d", g_data_rate);
+    MYLOG("SETUP", "DR = %d", loraConfig.dataRate);
   }
 
-  /** Wait for Join success */
-  while (api.lorawan.njs.get() == 0)
-  {
-    Serial.println("Wait for LoRaWAN join...");
-    api.lorawan.join();
-    delay(10000);
-  }
+  lorawanJoin();
 
   // Enable low power mode
   api.system.lpm.set(1);
@@ -199,55 +252,52 @@ void sensor_handler(void *)
     if (!api.lorawan.njs.get())
     {
       MYLOG("UPLINK", "Not joined, skip sending");
+      lorawanJoin();
       return;
     }
   }
 
-  temperature_encoded = temperature_Read() * 10.0f;
-  humidity_encoded = humidity_Read() * 2.0f;
+  appState.temperature = temperature_Read() * 10.0f;
+  appState.humidity = humidity_Read() * 2.0f;
 
-  // Create payload
-  // Cayenne LPP temperature
-  uplink_payload[0] = 0x01;
-  uplink_payload[1] = 0x67; // Cayenne LPP temperature
-  uplink_payload[2] = (uint8_t)(temperature_encoded >> 8);
-  uplink_payload[3] = (uint8_t)(temperature_encoded & 0xFF);
+  // Cayenne LPP payload creation
+  appState.uplinkPayload[0] = 0x01;
+  appState.uplinkPayload[1] = 0x67; // Cayenne LPP temperature
+  appState.uplinkPayload[2] = static_cast<uint8_t>(appState.temperature >> 8);
+  appState.uplinkPayload[3] = static_cast<uint8_t>(appState.temperature & 0xFF);
+  appState.uplinkPayload[4] = 0x01;
+  appState.uplinkPayload[5] = 0x68; // Cayenne LPP humidity
+  appState.uplinkPayload[6] = static_cast<uint8_t>(appState.humidity);
 
-  // Cayenne LPP humidity
-  uplink_payload[4] = 0x01;
-  uplink_payload[5] = 0x68; // Cayenne LPP humidity
-  uplink_payload[6] = (uint8_t)(humidity_encoded);
-
-  // Send the packet
   send_packet();
 }
 
 /**
  * @brief Send the data packet that was prepared in
  * Cayenne LPP format by the different sensor and location
- * aqcuision functions
+ * acquisition functions
  *
  */
 void send_packet(void)
 {
-  MYLOG("UPLINK", "Sending packet # %d", my_fcount);
-  my_fcount++;
-  // Send the packet
-  if (api.lorawan.send(7, uplink_payload, fPort, g_confirmed_mode, g_confirmed_retry))
+  MYLOG("UPLINK", "Sending packet # %u", appState.frameCounter);
+  appState.frameCounter++;
+
+  if (api.lorawan.send(7, appState.uplinkPayload, appState.fPort, loraConfig.confirmedMode, loraConfig.confirmedRetry))
   {
     MYLOG("UPLINK", "Packet enqueued, size 4");
-    tx_active = true;
+    appState.txActive = true;
   }
   else
   {
     MYLOG("UPLINK", "Send failed");
-    tx_active = false;
+    appState.txActive = false;
   }
 }
 
 /**
- * @brief This example is complete timer driven.
- * The loop() does nothing than sleep.
+ * @brief This program is completely timer driven.
+ * The loop() does nothing other than sleep.
  *
  */
 void loop()

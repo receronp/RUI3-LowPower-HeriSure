@@ -52,6 +52,57 @@ bool init_interval_at(void)
 }
 
 /**
+ * @brief Updates the sending interval based on the provided argument.
+ *
+ * @param argv A string representing the new sending interval in seconds.
+ * @return int AT_OK if successful, AT_PARAM_ERROR if the argument is invalid.
+ */
+int update_send_interval(const char *argv)
+{
+	// Check for valid input
+	for (size_t i = 0; argv[i] != '\0'; ++i)
+	{
+		if (!isdigit(argv[i]))
+		{
+			return AT_PARAM_ERROR;
+		}
+	}
+
+	// Convert the string to a uint32_t
+	char *endptr;
+	uint32_t newInterval = strtoul(argv, &endptr, 10);
+
+	// Check for conversion errors
+	if (*endptr != '\0')
+	{
+		return AT_PARAM_ERROR;
+	}
+
+	// Store old interval
+	uint32_t oldInterval = custom_parameters.send_interval;
+
+	// Update the interval (convert seconds to milliseconds)
+	custom_parameters.send_interval = newInterval * 1000;
+
+	MYLOG("INTERVAL", "New interval: %lu ms", custom_parameters.send_interval);
+
+	// Stop and restart the timer.  Handle the case where the new interval is 0.
+	api.system.timer.stop(RAK_TIMER_0);
+	if (custom_parameters.send_interval != 0)
+	{
+		api.system.timer.start(RAK_TIMER_0, custom_parameters.send_interval, nullptr);
+	}
+
+	// Save settings only if the interval has changed
+	if (oldInterval != custom_parameters.send_interval)
+	{
+		save_at_setting();
+	}
+
+	return AT_OK;
+}
+
+/**
  * @brief Handler for send interval AT commands
  *
  * @param port Serial port used
@@ -69,36 +120,9 @@ int interval_send_handler(SERIAL_PORT port, char *cmd, stParam *param)
 	}
 	else if (param->argc == 1)
 	{
-		uint32_t old_send_freq = custom_parameters.send_interval;
-
-		// MYLOG("AT_CMD", "param->argv[0] >> %s", param->argv[0]);
-		for (int i = 0; i < strlen(param->argv[0]); i++)
+		if (update_send_interval(param->argv[0]) != AT_OK)
 		{
-			if (!isdigit(*(param->argv[0] + i)))
-			{
-				// MYLOG("AT_CMD", "%d is no digit", i);
-				return AT_PARAM_ERROR;
-			}
-		}
-
-		uint32_t new_send_freq = strtoul(param->argv[0], NULL, 10);
-
-		MYLOG("AT_CMD", "Requested interval %ld s", new_send_freq);
-
-		custom_parameters.send_interval = new_send_freq * 1000;
-
-		MYLOG("AT_CMD", "New interval %ld ms", custom_parameters.send_interval);
-		// Stop the timer
-		api.system.timer.stop(RAK_TIMER_0);
-		if (custom_parameters.send_interval != 0)
-		{
-			// Restart the timer
-			api.system.timer.start(RAK_TIMER_0, custom_parameters.send_interval, NULL);
-		}
-		// Save custom settings if needed
-		if (old_send_freq != custom_parameters.send_interval)
-		{
-			save_at_setting();
+			return AT_PARAM_ERROR;
 		}
 	}
 	else
